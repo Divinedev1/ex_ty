@@ -1,0 +1,15 @@
+node_modules
+dist
+.git
+coverage
+tests
+jest.config.mjs
+jest.coverage.config.mjs
+*.md
+*.log
+.env
+.env.example
+Dockerfile
+.dockerignore
+ex_ty.env
+ex_ty.env.example
