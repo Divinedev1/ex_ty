@@ -2,8 +2,8 @@
 
 A production-shaped Express API for a pet-adoption domain, built to show how the pieces fit
 together: strict TypeScript, layered HTTP code, Postgres with SQL isolated in repositories, Redis
-caching, RabbitMQ audit events, a non-root Docker image, an nginx-fronted Compose stack, and a CI
-pipeline that enforces tests and coverage.
+caching, RabbitMQ audit events, a non-root Docker image, an nginx/Caddy-fronted Compose stack, and a
+CI/CD pipeline that enforces tests and coverage before deploying.
 
 `GUIDE.md` is the long-form walkthrough; this README is the quick start.
 
@@ -12,7 +12,7 @@ pipeline that enforces tests and coverage.
 - Node.js 22, Express 5, TypeScript 7 (native compiler), ESM
 - Postgres 17 + `pg`, Redis 7, RabbitMQ 4 (`amqplib`)
 - JWT access tokens, bcrypt password hashing, `express-rate-limit`
-- Jest (`@swc/jest`) for unit and integration tests, oxlint, Docker, nginx, GitHub Actions
+- Jest (`@swc/jest`) for unit and integration tests, oxlint, Docker, nginx, Caddy, GitHub Actions
 
 ## Architecture
 
@@ -152,17 +152,58 @@ BROKER_ENABLED=true npm run test:coverage
 
 Coverage requires the integration services and a broker for the full baseline.
 
-## CI
+## CI/CD
 
-`.github/workflows/ci.yml` runs on every push and pull request as one ordered job:
+`.github/workflows/ci.yml` has three jobs:
 
-```
-install -> lint -> typecheck -> unit tests -> tests + coverage -> build
-```
+| Job | Trigger | What it does |
+| --- | --- | --- |
+| `test` | pull requests and pushes | lint, typecheck, unit tests, coverage, `tsc` build |
+| `publish` | push to `master`, or manual run with empty `image_tag` | builds and pushes `ghcr.io/divinedev1/ex_ty:<sha>` (and `:latest`) for `linux/amd64` |
+| `deploy` | after `publish`, or manual run with an existing `image_tag` | uploads deploy files to the VPS, runs migrations, restarts the stack, checks `/health/ready` |
 
 Postgres, Redis, and RabbitMQ are service containers with health checks, and `BROKER_ENABLED=true`
 so no test is skipped. The coverage report is uploaded as the `coverage` artifact (7 days), and
 missing thresholds fail the job.
+
+Run the workflow manually from **Actions → CI/CD → Run workflow** on `master`. Leave `image_tag`
+empty to publish and deploy the current commit, or provide an older SHA tag to redeploy/roll back.
+
+## Production deployment
+
+The production target is one Interserver VPS running Docker Compose, with Caddy terminating TLS in
+front of nginx. Images come from a private GHCR package. Brief downtime during container recreation
+is expected.
+
+One-time VPS setup:
+
+1. Use Ubuntu 24.04 or 26.04 with at least 2 GB RAM, point a DNS `A` record at the VPS, and allow
+   `80/443` in the Interserver panel.
+2. Run `deploy/vps-bootstrap.sh` as root with your SSH key, for example:
+   `SSH_PUBLIC_KEY="ssh-ed25519 ..." sh deploy/vps-bootstrap.sh`. It installs Docker, creates the
+   `deploy` user, configures UFW (`22/80/443`), and adds swap. SSH hardening is only applied when
+   `SSH_PUBLIC_KEY` is provided; adjust the firewall if SSH uses another port.
+3. Copy `deploy/env.example` to `/opt/ex_ty/.env` and `deploy/app.env.example` to
+   `/opt/ex_ty/app.env`; fill in real secrets, set `TRUST_PROXY_HOPS=2`, and keep the database
+   password in `DATABASE_URL` in sync with `POSTGRES_PASSWORD`. Set both files to mode `600` and
+   owner `deploy`.
+4. Create a fine-grained GitHub PAT with only `read:packages`, then set `GHCR_USER` and
+   `GHCR_TOKEN` in `/opt/ex_ty/.env`.
+5. Create a GitHub Environment named `production` with secrets: `VPS_HOST`, `VPS_USER`,
+   `VPS_SSH_KEY`, `VPS_KNOWN_HOSTS`, and `PRODUCTION_URL`. Generate known hosts with
+   `ssh-keyscan -H <host>`.
+6. Push to `master`. CI publishes the image, copies `compose.prod.yaml`, `nginx.conf`, `Caddyfile`,
+   and `deploy/deploy.sh` to `/opt/ex_ty`, then runs the deploy script.
+
+Operational notes:
+
+- Caddy issues and renews certificates automatically once DNS resolves; only `80/443` are public.
+  Make sure no host nginx/Apache is already bound to those ports.
+- Postgres, Redis, and RabbitMQ stay on the private Compose network with named volumes.
+- Each deploy dumps Postgres to `/opt/ex_ty/backups` before migrations and keeps seven days.
+- Logs: `docker compose -f compose.prod.yaml logs -f app proxy caddy`.
+- The deploy script rolls back to the previous image tag if the rollout or readiness check fails.
+  Destructive future migrations still need a tested forward-fix or restore plan.
 
 ## Layout
 
@@ -183,11 +224,15 @@ tests/
 ├── *.unit.test.ts            pure logic
 ├── *.integration.test.ts     supertest against the app
 └── setup/                    env defaults and DB/Redis global setup
+compose.yaml                  local Compose stack with a local build
+compose.prod.yaml             VPS stack using the published image
+Caddyfile                     automatic TLS in front of nginx
+deploy/                       env templates, deploy script, VPS bootstrap
 ```
 
 ## Security notes
 
-This is a learning project. Before production: rotate and vault `JWT_SECRET`, terminate TLS with
-HSTS, restrict CORS to known origins, use versioned migrations, add refresh tokens and write
-endpoints with body validation, and add publisher confirms/DLQ/outbox for messaging. See
-“Before you use this in production” in `GUIDE.md` for the full list.
+This is a learning project. The production stack terminates TLS with Caddy and HSTS, but before
+real use: rotate and vault `JWT_SECRET`, restrict CORS to known origins, use versioned migrations,
+add refresh tokens and write endpoints with body validation, and add publisher confirms/DLQ/outbox
+for messaging. See “Before you use this in production” in `GUIDE.md` for the full list.

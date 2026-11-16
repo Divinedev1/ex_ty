@@ -26,16 +26,19 @@ so you can observe the cache in `curl`.
 Logins are published as **audit events** to **RabbitMQ** and persisted to an `audit_events` table by
 a background consumer. Broker failures never break the request path.
 
-Stack: **Express 5 + TypeScript (ESM) + PostgreSQL 16 via `pg`**, plus JWT auth, rate limiting,
+Stack: **Express 5 + TypeScript (ESM) + PostgreSQL 17 via `pg`**, plus JWT auth, rate limiting,
 Redis caching, RabbitMQ messaging, a non-root multi-stage **Docker** image, and a **Compose** stack
 fronted by **nginx**.
 
 ```
 Dockerfile                     multi-stage build → distroless-ish runtime (non-root)
 .dockerignore                  keeps secrets, tests, and build output out of the context
-.github/workflows/ci.yml       install → lint → typecheck → unit → coverage → build
-compose.yaml                   app replicas + Postgres + Redis + RabbitMQ + nginx
-nginx.conf                     reverse proxy / load balancer (http-context include)
+.github/workflows/ci.yml       test → publish image → deploy to VPS
+compose.yaml                   local stack: app replicas + Postgres + Redis + RabbitMQ + nginx
+compose.prod.yaml              VPS stack: published image + nginx + Caddy
+nginx.conf                     reverse proxy with dynamic upstream resolution
+Caddyfile                      automatic TLS and security headers
+deploy/                        env templates, deploy script, VPS bootstrap
 README.md                      quick start, env/API reference, testing and CI summary
 .env.example                   committed local-dev env (copy to .env)
 ex_ty.env.example              committed dev-only container env (copy to ex_ty.env)
@@ -1116,8 +1119,9 @@ docker compose -f compose.yaml down -v            # stop and delete volumes
 
 ## Stage 14 — CI pipeline
 
-`.github/workflows/ci.yml` runs on every push and pull request. It is one job with ordered steps, so
-a failure anywhere stops the pipeline and the check turns red:
+`.github/workflows/ci.yml` runs on every push and pull request. The `test` job has ordered steps, so
+a failure anywhere stops the pipeline and the check turns red (publishing and deployment are
+separate jobs covered in Stage 16):
 
 ```
 npm ci → lint → typecheck → unit tests → tests + coverage → build
@@ -1376,10 +1380,162 @@ it *could* see were fixed by keeping strict mode on and declaring query types pr
 
 ---
 
+## Stage 16 — CI/CD to a VPS
+
+The deploy target is one Interserver VPS running Docker Compose. GitHub Actions builds and publishes
+a private image, then SSHes in and rolls the stack forward:
+
+```
+pull request / push              -> test
+push master, manual empty tag    -> publish image to GHCR -> deploy to VPS -> health check
+manual existing image_tag        -> deploy to VPS -> health check (redeploy or roll back)
+```
+
+### The three jobs
+
+`test` is the original gate: lint, typecheck, unit tests, all-test coverage, and `tsc` build. It runs
+on PRs and every push.
+
+`publish` runs after `test` for `master` pushes and for manual runs with an empty `image_tag`. It
+logs in to GHCR with the repository `GITHUB_TOKEN` (`packages: write`), builds `linux/amd64`, and
+pushes two tags:
+
+```text
+ghcr.io/divinedev1/ex_ty:<git-sha>
+ghcr.io/divinedev1/ex_ty:latest
+```
+
+Pin deploys to the SHA tag; `latest` is for humans. GHCR requires lowercase repository paths, so the
+owner is hard-coded as `divinedev1` even though GitHub displays `Divinedev1`.
+
+`deploy` needs both jobs and runs only if `test` passed and either `publish` succeeded or a manual
+`image_tag` was supplied. It uses the `production` GitHub Environment for secrets:
+
+| Secret | Purpose |
+| --- | --- |
+| `VPS_HOST` | VPS address |
+| `VPS_USER` | `deploy` user |
+| `VPS_SSH_KEY` | private key for that user |
+| `VPS_KNOWN_HOSTS` | pinned host keys (`ssh-keyscan -H <host>`) |
+| `PRODUCTION_URL` | `https://your-domain` for the final smoke test |
+
+The job writes the key and known-hosts into `~/.ssh`, copies `compose.prod.yaml`, `nginx.conf`,
+`Caddyfile`, and `deploy/deploy.sh` to `/opt/ex_ty`, then runs the deploy script with the tag. It
+finishes with a retried `curl` against `$PRODUCTION_URL/health/ready`.
+
+The manual trigger has no required input. Run it on `master` with an empty `image_tag` to publish and
+deploy the current commit; supplying an older SHA redeploys it without rebuilding. Deploy concurrency
+is a single `deploy-production` group with `cancel-in-progress: false`, so a push never kills a
+rollout halfway.
+
+### Private registry credentials
+
+The GHCR package is private. The Actions runner pushes with `GITHUB_TOKEN`; the VPS pulls with a
+separate fine-grained PAT that has only `read:packages`. That token lives in `/opt/ex_ty/.env`, not
+in the repo, and `deploy.sh` performs `docker login ghcr.io` before pulling. Rotate the PAT before it
+expires.
+
+### Two env files, on purpose
+
+`app.env` is passed to the `app` and `migrate` containers. `/opt/ex_ty/.env` is read by Compose for
+interpolation and by the deploy script for operations, so it also holds the GHCR credentials and
+database/RabbitMQ admin passwords. Keeping them separate means the app container never receives the
+registry token.
+
+`TRUST_PROXY_HOPS=2` is required in production: the chain is client → Caddy → nginx → Express.
+With one trusted hop, Express would attribute every request to nginx.
+
+### Production Compose differences
+
+`compose.prod.yaml` removes every `build:` block and uses
+`${IMAGE_NAME}:${IMAGE_TAG}` for both `app` and `migrate`. `migrate` is still a one-shot service; the
+`app` services wait for it with `service_completed_successfully`, so a failed migration prevents the
+new app containers from starting.
+
+Postgres, Redis, and RabbitMQ stay internal with named volumes. nginx is published only on
+`127.0.0.1:8080` so the deploy script can probe readiness without exposing another public port.
+Caddy publishes `80/443`, gets certificates automatically, adds HSTS and basic security headers, and
+proxies to nginx.
+
+### nginx must re-resolve replicas
+
+The original upstream was:
+
+```nginx
+upstream app_upstream {
+    server app:5000;
+}
+```
+
+nginx resolves that once at startup. When Compose recreates the app containers with new IPs, nginx
+keeps using the old address and returns 502s. The production config adds:
+
+```nginx
+resolver 127.0.0.11 valid=10s ipv6=off;
+
+upstream app_upstream {
+    zone app_upstream 64k;
+    server app:5000 resolve;
+    keepalive 32;
+}
+```
+
+`resolve` requires nginx 1.27.3+, so both Compose files pin `nginx:1.29-alpine`. The access log and
+request-ID forwarding are unchanged.
+
+Caddy also means nginx sees `X-Forwarded-Proto: https` from the outside. Overwriting it with
+`$scheme` would tell the app it is on plain HTTP, so nginx uses a `map` that preserves the incoming
+header and falls back to `$scheme` for direct local requests.
+
+### What the deploy script does
+
+`deploy/deploy.sh <tag>` runs on the VPS:
+
+1. Source `/opt/ex_ty/.env`, log in to GHCR, and `docker compose pull app migrate`.
+2. Start Postgres/Redis/RabbitMQ and wait for health, then `pg_dump` the database into
+   `backups/pre-<tag>.sql.gz`.
+3. Delete dumps older than seven days.
+4. `docker compose up -d --wait --remove-orphans`. Compose runs `migrate` first because of the
+   dependency condition.
+5. Poll `http://127.0.0.1:8080/health/ready` for up to a minute.
+6. On failure, redeploy the tag in `.current-tag` and exit non-zero; on success, record the new tag
+   and prune images older than seven days.
+
+The rollback restores the previous **image**, not the database. Current migrations are idempotent
+schema creation, but a destructive future migration needs a tested restore plan (the dump is on the
+same VPS, so copy backups offsite before relying on them).
+
+### One-time VPS setup
+
+`deploy/vps-bootstrap.sh` installs Docker and Compose, creates the `deploy` user, adds it to the
+`docker` group, configures UFW (`22/80/443`), creates `/opt/ex_ty/backups`, and adds swap. SSH
+password auth is disabled only when you pass `SSH_PUBLIC_KEY`, so you cannot lock yourself out by
+accident:
+
+```bash
+SSH_PUBLIC_KEY="$(cat ~/.ssh/id_ed25519.pub)" sh deploy/vps-bootstrap.sh
+```
+
+Then copy the two examples into `/opt/ex_ty`, fill in real secrets, set mode `600`, create the
+`production` GitHub Environment and its secrets, point DNS at the VPS, and push to `master`.
+
+### Verification and limits
+
+Check the rollout with `docker compose -f compose.prod.yaml ps`, `curl
+https://$DOMAIN/health/ready`, `curl https://$DOMAIN/pets`, and
+`docker compose -f compose.prod.yaml logs -f app proxy caddy`. A request should appear in nginx and
+app logs with the same `request_id`.
+
+There is still a short gap while Compose recreates both app replicas; Caddy and nginx will return
+502s until the new containers pass health checks. True zero-downtime needs a rolling deploy tool or a
+blue/green setup. Backups, monitoring, and offsite copies remain operational gaps.
+
+---
+
 ## Before you use this in production
 
-Honest gap list — this is a learning project. Coverage thresholds, structured logging, and request
-IDs are now in place; close these next:
+Honest gap list — this is a learning project. Coverage thresholds, structured logging, request IDs,
+and the VPS delivery pipeline are now in place; close these next:
 
 **Missing entirely**
 
@@ -1397,7 +1553,8 @@ IDs are now in place; close these next:
 
 - Rotate and vault the `JWT_SECRET`; keep it out of source entirely. Prefer RS256 if multiple
   services verify tokens.
-- HTTPS/HSTS — never terminate TLS at the app *and* trust `trust proxy` incorrectly.
+- TLS/HSTS is handled by Caddy; keep termination there and do not also terminate at the app or
+  overwrite `X-Forwarded-Proto`.
 - CORS restricted to known origins; `cors()` with no options allows everyone.
 - Request body size limits are set (100kb), but add payload-shape validation (`zod`/`valibot`) for
   bodies once you add write endpoints.
@@ -1410,10 +1567,14 @@ IDs are now in place; close these next:
   O(1), but a burst of concurrent misses can still all hit Postgres.
 - Messaging hardening: use a non-guest AMQP user with least-privilege permissions, `amqps://` in
   transit, publisher confirms, a bounded prefetch, and a dead-letter queue for handler failures.
+- Copy database dumps offsite and test restores; the pre-deploy backup lives on the same VPS.
+- Add uptime/error monitoring and alerting; the health checks only cover the deploy moment.
+- Rotate the GHCR read token before expiry and keep it scoped to `read:packages`.
+- A recreate still causes a short 502 window; move to rolling or blue/green deploys when required.
 
 **Process**
 
-- Enforce CI with branch protection and required checks once the repository is pushed.
+- Enable branch protection and required CI checks on `master` in the GitHub repository.
 - Add Dependabot or Renovate for dependency updates.
 - Ratchet coverage thresholds upward as tests are added; inspect the uploaded artifact on failures.
 

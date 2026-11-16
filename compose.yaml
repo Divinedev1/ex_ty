@@ -105,7 +105,7 @@ services:
     restart: unless-stopped
 
   proxy:
-    image: nginx:alpine
+    image: nginx:1.29-alpine
     logging: *default-logging
     ports:
       - "8080:80"
